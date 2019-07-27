@@ -17,21 +17,21 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 #[derive(Debug, Clone)]
 struct FileInfo {
-    content_length: u32,
+    content_length: u64,
     supports_range: bool,
 }
 
 #[derive(Debug, Clone)]
 struct Options<'a> {
-    parts: u32,
+    parts: u64,
     url: &'a str,
     dest: &'a Path,
 }
 
 #[derive(Debug, Clone)]
 struct RangeQuery {
-    range: Range<u32>,
-    idx: u32,
+    range: Range<u64>,
+    idx: u64,
 }
 
 async fn file_info<C>(client: &Client<C>, url: &str) -> Result<FileInfo>
@@ -52,7 +52,7 @@ where
         .get(header::CONTENT_LENGTH)
         .ok_or_else(|| ErrMsg::new("no content type"))?
         .to_str()?
-        .parse::<u32>()?;
+        .parse::<u64>()?;
     let supports_range = res
         .headers()
         .get(header::ACCEPT_RANGES)
@@ -72,12 +72,13 @@ where
 {
     let file_info = file_info(client, opts.url).await?;
     dbg!(&file_info);
-    let ranges: Vec<_> = ranges(file_info.content_length, opts.parts).collect();
-    dbg!(ranges);
+    let parts = if file_info.supports_range { opts.parts } else { 1 };
+    let ranges: Vec<_> = ranges(file_info.content_length, parts).collect();
+    dbg!(&ranges);
     Ok(())
 }
 
-fn ranges(content_length: u32, parts: u32) -> impl Iterator<Item=RangeQuery> {
+fn ranges(content_length: u64, parts: u64) -> impl Iterator<Item=RangeQuery> {
     let part_len = content_length / parts;
     
     (0..parts).map(move |idx| {
