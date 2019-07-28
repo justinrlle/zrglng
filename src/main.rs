@@ -5,15 +5,19 @@ mod error;
 use std::{
     path::Path,
     ops::Range,
+    fs::File,
+    io::Write as _,
 };
 
 use error::ErrMsg;
 
 use hyper::{header, Client};
+use futures_util::{TryStreamExt, future::join_all};
 
 static USER_AGENT: &str = concat!("Paraget/", env!("CARGO_PKG_VERSION"));
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+type HttpsClient = hyper::Client<hyper_tls::HttpsConnector<hyper::client::HttpConnector>>;
 
 #[derive(Debug, Clone)]
 struct FileInfo {
@@ -34,12 +38,7 @@ struct RangeQuery {
     idx: u64,
 }
 
-async fn file_info<C>(client: &Client<C>, url: &str) -> Result<FileInfo>
-where
-    C: hyper::client::connect::Connect + Sync + 'static,
-    C::Transport: 'static,
-    C::Future: 'static,
-{
+async fn file_info(client: &HttpsClient, url: &str) -> Result<FileInfo> {
     let req = hyper::Request::head(url)
         .header(header::USER_AGENT, USER_AGENT)
         .body(hyper::Body::empty())?;
@@ -64,27 +63,48 @@ where
     })
 }
 
-async fn parallel_get<C>(client: &Client<C>, opts: &Options<'_>) -> Result<()>
-where
-    C: hyper::client::connect::Connect + Sync + 'static,
-    C::Transport: 'static,
-    C::Future: 'static,
-{
+async fn partial_get(client: &HttpsClient, url: &str, _dest: &Path, range: RangeQuery) -> Result<(u64, bytes::Bytes)> {
+    let range_header = format!("bytes={}-{}", range.range.start, range.range.end - 1);
+    let range_header: &str = range_header.as_ref();
+    let req = hyper::Request::get(url)
+        .header(header::USER_AGENT, USER_AGENT)
+        .header(header::RANGE, range_header)
+        .body(hyper::Body::empty())?;
+    let res = client.request(req).await?;
+    if !res.status().is_success() {
+        return Err(ErrMsg::new("invalid status code").into());
+    }
+    Ok((range.idx, res.into_body().try_concat().await?.into_bytes()))
+    
+}
+
+async fn parallel_get(client: &HttpsClient, opts: &Options<'_>) -> Result<()> {
     let file_info = file_info(client, opts.url).await?;
     dbg!(&file_info);
     let parts = if file_info.supports_range { opts.parts } else { 1 };
-    let ranges: Vec<_> = ranges(file_info.content_length, parts).collect();
-    dbg!(&ranges);
+    let ranges = get_ranges(file_info.content_length, parts);
+    dbg!(ranges.clone().collect::<Vec<_>>());
+
+    let partial_reqs = ranges
+        .map(|range| partial_get(client, opts.url, opts.dest, range));
+
+    let bodies = join_all(partial_reqs).await;
+    let bodies = bodies.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut out_file = File::create(opts.dest)?;
+    for (idx, body) in bodies.iter() {
+        dbg!(idx, body.len());
+        out_file.write_all(body.as_ref())?;
+    }
     Ok(())
 }
 
-fn ranges(content_length: u64, parts: u64) -> impl Iterator<Item=RangeQuery> {
+fn get_ranges(content_length: u64, parts: u64) -> impl Iterator<Item=RangeQuery> + Clone{
     let part_len = content_length / parts;
     
     (0..parts).map(move |idx| {
         let start = idx * part_len;
         let end = if idx + 1 < parts {
-            (idx + 1) * part_len - 1
+            (idx + 1) * part_len
         } else {
             content_length
         };
