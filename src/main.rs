@@ -3,16 +3,14 @@
 mod error;
 
 use std::{
-    path::Path,
     ops::Range,
-    fs::File,
-    io::Write as _,
+    path::{Path, PathBuf},
 };
 
 use error::ErrMsg;
 
-use hyper::{header, Client};
-use futures_util::{TryStreamExt, future::join_all};
+use futures_util::{future::join_all, StreamExt};
+use hyper::header;
 
 static USER_AGENT: &str = concat!("Paraget/", env!("CARGO_PKG_VERSION"));
 
@@ -63,7 +61,25 @@ async fn file_info(client: &HttpsClient, url: &str) -> Result<FileInfo> {
     })
 }
 
-async fn partial_get(client: &HttpsClient, url: &str, _dest: &Path, range: RangeQuery) -> Result<(u64, bytes::Bytes)> {
+async fn partial_get(
+    client: &HttpsClient,
+    url: &str,
+    dest: &Path,
+    range: RangeQuery,
+) -> Result<(u64, PathBuf)> {
+    let mut tmp_path = PathBuf::from(dest);
+    let filename = {
+        let mut filename = std::ffi::OsString::from(".");
+        let final_filename = tmp_path
+            .file_name()
+            .ok_or_else(|| ErrMsg::new("expected a file, got a directory"))?
+            .to_owned();
+        filename.push(final_filename);
+        filename.push(format!(".part-{}", range.idx));
+        filename
+    };
+    dbg!(&filename, range.idx);
+    tmp_path.set_file_name(&filename);
     let range_header = format!("bytes={}-{}", range.range.start, range.range.end - 1);
     let range_header: &str = range_header.as_ref();
     let req = hyper::Request::get(url)
@@ -74,33 +90,57 @@ async fn partial_get(client: &HttpsClient, url: &str, _dest: &Path, range: Range
     if !res.status().is_success() {
         return Err(ErrMsg::new("invalid status code").into());
     }
-    Ok((range.idx, res.into_body().try_concat().await?.into_bytes()))
-    
+    eprintln!("creaing file");
+    let file = tokio::fs::File::create(PathBuf::from(tmp_path.clone())).await?;
+    eprintln!("copying chunks from req to file");
+    let file = res.into_body()
+        .fold(Ok(file), |try_file, chunk| write_chunk(chunk, try_file))
+        .await?;
+    eprintln!("finished downloading part {}", range.idx);
+    Ok((range.idx, tmp_path))
+}
+
+async fn write_chunk(
+    chunk: hyper::Result<hyper::Chunk>,
+    try_file: Result<tokio::fs::File>,
+) -> Result<tokio::fs::File> {
+    if let Ok(mut file) = try_file {
+        let bytes = chunk?.into_bytes();
+        dbg!(bytes.len());
+        use tokio::io::AsyncWriteExt;
+        file.write_all(&bytes).await?;
+        Ok(file)
+    } else {
+        try_file
+    }
 }
 
 async fn parallel_get(client: &HttpsClient, opts: &Options<'_>) -> Result<()> {
     let file_info = file_info(client, opts.url).await?;
     dbg!(&file_info);
-    let parts = if file_info.supports_range { opts.parts } else { 1 };
+    let parts = if file_info.supports_range {
+        opts.parts
+    } else {
+        1
+    };
     let ranges = get_ranges(file_info.content_length, parts);
     dbg!(ranges.clone().collect::<Vec<_>>());
 
-    let partial_reqs = ranges
-        .map(|range| partial_get(client, opts.url, opts.dest, range));
+    let partial_reqs = ranges.map(|range| partial_get(client, opts.url, opts.dest, range));
 
-    let bodies = join_all(partial_reqs).await;
-    let bodies = bodies.into_iter().collect::<Result<Vec<_>>>()?;
-    let mut out_file = File::create(opts.dest)?;
-    for (idx, body) in bodies.iter() {
-        dbg!(idx, body.len());
-        out_file.write_all(body.as_ref())?;
+    let paths = join_all(partial_reqs).await;
+    let paths = paths.into_iter().collect::<Result<Vec<_>>>()?;
+    //let mut out_file = tokio::fs::File::create(opts.dest).await?;
+    for (idx, path) in paths.iter() {
+        dbg!(idx, path.display());
+        // out_file.write_all(body.as_ref())?;
     }
     Ok(())
 }
 
-fn get_ranges(content_length: u64, parts: u64) -> impl Iterator<Item=RangeQuery> + Clone{
+fn get_ranges(content_length: u64, parts: u64) -> impl Iterator<Item = RangeQuery> + Clone {
     let part_len = content_length / parts;
-    
+
     (0..parts).map(move |idx| {
         let start = idx * part_len;
         let end = if idx + 1 < parts {
@@ -133,7 +173,7 @@ async fn run() -> Result<()> {
         dest: dest_from_url(&url),
     };
     let https = hyper_tls::HttpsConnector::new(4)?;
-    let client = Client::builder().build(https);
+    let client = hyper::Client::builder().build(https);
     parallel_get(&client, &opts).await?;
     Ok(())
 }
