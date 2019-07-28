@@ -1,4 +1,4 @@
-#![feature(async_await)]
+#![feature(async_await, error_iter)]
 
 mod error;
 
@@ -6,8 +6,6 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
 };
-
-use error::ErrMsg;
 
 use futures_util::{future::join_all, StreamExt};
 use hyper::header;
@@ -42,12 +40,12 @@ async fn file_info(client: &HttpsClient, url: &str) -> Result<FileInfo> {
         .body(hyper::Body::empty())?;
     let res = client.request(req).await?;
     if !res.status().is_success() {
-        return Err(ErrMsg::new("invalid status code").into());
+        bail!("invalid status code");
     }
     let content_length = res
         .headers()
         .get(header::CONTENT_LENGTH)
-        .ok_or_else(|| ErrMsg::new("no content type"))?
+        .ok_or_else(|| err!("no content type"))?
         .to_str()?
         .parse::<u64>()?;
     let supports_range = res
@@ -72,7 +70,7 @@ async fn partial_get(
         let mut filename = std::ffi::OsString::from(".");
         let final_filename = tmp_path
             .file_name()
-            .ok_or_else(|| ErrMsg::new("expected a file, got a directory"))?
+            .ok_or_else(|| err!("expected a file, got a directory"))?
             .to_owned();
         filename.push(final_filename);
         filename.push(format!(".part-{}", range.idx));
@@ -86,16 +84,26 @@ async fn partial_get(
         .header(header::USER_AGENT, USER_AGENT)
         .header(header::RANGE, range_header)
         .body(hyper::Body::empty())?;
-    let res = client.request(req).await?;
+    let res = client.request(req).await.map_err(|e| {
+        err_of!(
+            e,
+            "failed to do patial get of following bytes: {:?}",
+            range.range
+        )
+    })?;
     if !res.status().is_success() {
-        return Err(ErrMsg::new("invalid status code").into());
+        bail!("invalid status code");
     }
-    eprintln!("creaing file");
-    let file = tokio::fs::File::create(PathBuf::from(tmp_path.clone())).await?;
+    eprintln!("creating file");
+    let file = tokio::fs::File::create(PathBuf::from(&tmp_path))
+        .await
+        .map_err(|e| err_of!(e, "failed to create tmp file at {}", &tmp_path.display()))?;
     eprintln!("copying chunks from req to file");
-    let file = res.into_body()
+    let file = res
+        .into_body()
         .fold(Ok(file), |try_file, chunk| write_chunk(chunk, try_file))
-        .await?;
+        .await
+        .map_err(|e| err_of!(e, "failed to write file"))?;
     eprintln!("finished downloading part {}", range.idx);
     Ok((range.idx, tmp_path))
 }
@@ -108,7 +116,9 @@ async fn write_chunk(
         let bytes = chunk?.into_bytes();
         dbg!(bytes.len());
         use tokio::io::AsyncWriteExt;
-        file.write_all(&bytes).await?;
+        file.write_all(&bytes)
+            .await
+            .map_err(|e| err_of!(e, "failed to write a chunk"))?;
         Ok(file)
     } else {
         try_file
@@ -116,7 +126,9 @@ async fn write_chunk(
 }
 
 async fn parallel_get(client: &HttpsClient, opts: &Options<'_>) -> Result<()> {
-    let file_info = file_info(client, opts.url).await?;
+    let file_info = file_info(client, opts.url)
+        .await
+        .map_err(|e| err_of!(e, "failed to do HEAD req"))?;
     dbg!(&file_info);
     let parts = if file_info.supports_range {
         opts.parts
@@ -168,7 +180,7 @@ async fn run() -> Result<()> {
     let target_url = "http://i.redd.it/f61r13m3k2931.jpg";
     let url = url::Url::parse(target_url)?;
     let opts = Options {
-        parts: 4,
+        parts: 1,
         url: target_url,
         dest: dest_from_url(&url),
     };
@@ -178,10 +190,19 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+fn main() {
+    env_logger::init();
+    tokio_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn tokio_main() {
     if let Err(err) = run().await {
         eprintln!("Error: {}", err);
+        let sources = std::iter::successors(err.source(), |err| err.source());
+        for source in sources {
+            eprintln!("  caused by: {}", source);
+        }
         std::process::exit(1);
     }
 }
