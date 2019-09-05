@@ -1,0 +1,70 @@
+trigger:
+  branches:
+    include: ['*']
+  tags:
+    include: ['*']
+
+variables:
+  nightly: nightly-2019-08-28
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+# Check formatting
+- job: rustfmt
+  displayName: Check rustfmt
+  pool:
+    vmImage: 'ubuntu-16.04'
+  steps:
+    - template: ci/install-rust.yml
+      parameters:
+        rust: $(nightly)
+        components: ["rustfmt"]
+    - script: |
+        cargo fmt --all -- --check
+      displayName: Check formating
+
+# Apply clippy lints to all crates
+- job: clippy
+  displayName: Check clippy
+  pool:
+    vmImage: 'ubuntu-16.04'
+  steps:
+    - template: ci/install-rust.yml
+      parameters:
+        rust: $(nightly)
+        components: ["clippy"]
+    - script: |
+        cargo clippy --all
+      displayName: Run clippy
+
+- job: check
+  displayName: Cargo check
+  pool:
+    vmImage: 'ubuntu-16.04'
+  steps:
+    - template: ci/install-rust.yml
+      parameters:
+        rust: $(nightly)
+    - script: |
+        cargo check --all
+      displayName: Run cargo check
+
+- job: build
+  displayName: Cargo build
+  strategy:
+    matrix:
+      linux:
+        imageName: 'ubuntu-16.04'
+      mac:
+        imageName: 'macos-10.13'
+      windows:
+        imageName: 'vs2017-win2016'
+  pool:
+    vmImage: $(imageName)
+  steps:
+    - template: ci/install-rust.yml
+      parameters:
+        rust: $(nightly)
+    - script: |
+        cargo test --all
+      displayName: Run cargo tests
