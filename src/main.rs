@@ -1,11 +1,7 @@
 mod error;
 
 use async_std::{fs, task};
-use std::{
-    ops::Range,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use futures::future::try_join_all;
 
@@ -37,7 +33,7 @@ impl PartialGetter {
     fn new(range: RangeQuery, url: &str, dest: &PathBuf) -> Self {
         let RangeQuery { range, idx } = range;
         let dest = {
-            let mut dest =  PathBuf::from(dest);
+            let mut dest = PathBuf::from(dest);
             let mut filename = std::ffi::OsString::from(".");
             let final_filename = dest
                 .file_name()
@@ -65,9 +61,14 @@ impl PartialGetter {
             .header(http::header::RANGE, range_header.as_str())
             .body(())?;
 
-        let mut res = client.send_async(req)
-            .await
-        .map_err(|e| err_of!(e, "failed partial get #{} for range: {:?}", self.idx, self.range))?;
+        let mut res = client.send_async(req).await.map_err(|e| {
+            err_of!(
+                e,
+                "failed partial get #{} for range: {:?}",
+                self.idx,
+                self.range
+            )
+        })?;
 
         if !res.status().is_success() {
             bail!("invalid status code: {}", res.status());
@@ -123,12 +124,12 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
     let file_info = file_info(&client, url)
         .await
         .map_err(|e| err_of!(e, "failed to do HEAD req"))?;
-    log::info!("file size: {}, supports range: {}", &file_info.content_length, &file_info.supports_range);
-    let parts = if file_info.supports_range {
-        parts
-    } else {
-        1
-    };
+    log::info!(
+        "file size: {}, supports range: {}",
+        &file_info.content_length,
+        &file_info.supports_range
+    );
+    let parts = if file_info.supports_range { parts } else { 1 };
     let ranges = get_ranges(file_info.content_length, parts);
     log::trace!("ranges: {:?}", ranges.clone().collect::<Vec<_>>());
 
@@ -196,7 +197,7 @@ struct Args {
     parts: u64,
     #[structopt(long, short, parse(from_os_str))]
     output: Option<PathBuf>,
-    url: String
+    url: String,
 }
 
 fn main() {
