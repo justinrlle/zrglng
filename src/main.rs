@@ -3,7 +3,7 @@ mod error;
 use async_std::{fs, task};
 use std::{
     ops::Range,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -183,17 +183,27 @@ fn dest_from_url(url: &url::Url) -> PathBuf {
     }
 }
 
-async fn run() -> Result<()> {
-    let target_url = "http://i.redd.it/f61r13m3k2931.jpg";
-    let url = url::Url::parse(target_url)?;
-    parallel_get(target_url, dest_from_url(&url), 2).await?;
+async fn run(args: Args) -> Result<()> {
+    let url = url::Url::parse(args.url.as_str())?;
+    let dest = args.output.unwrap_or_else(|| dest_from_url(&url));
+    parallel_get(args.url.as_str(), dest, args.parts).await?;
     Ok(())
+}
+
+#[derive(structopt::StructOpt, Debug)]
+struct Args {
+    #[structopt(long, short, default_value = "4")]
+    parts: u64,
+    #[structopt(long, short, parse(from_os_str))]
+    output: Option<PathBuf>,
+    url: String
 }
 
 fn main() {
     pretty_env_logger::init_timed();
+    let args = <Args as structopt::StructOpt>::from_args();
     task::block_on(async {
-        if let Err(err) = run().await {
+        if let Err(err) = run(args).await {
             eprintln!("Error: {}", err);
             let sources = std::iter::successors(err.source(), |err| err.source());
             for source in sources {
