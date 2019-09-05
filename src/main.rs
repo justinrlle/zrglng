@@ -67,7 +67,7 @@ impl PartialGetter {
 
         let mut res = client.send_async(req)
             .await
-        .map_err(|e| err_of!(e, "failed partial get for range: {:?}", self.range))?;
+        .map_err(|e| err_of!(e, "failed partial get #{} for range: {:?}", self.idx, self.range))?;
 
         if !res.status().is_success() {
             bail!("invalid status code: {}", res.status());
@@ -142,7 +142,7 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
 
     let mut files = try_join_all(partial_reqs)
         .await
-        .map_err(|e| err_of!(e, "failed to download a part"))?;
+        .map_err(|e| err_of!(e, "one of the parts failed to download"))?;
     let mut out_file = fs::File::create(&dest).await?;
     files.sort_unstable_by_key(|&(idx, _)| idx);
     for (_, path) in files {
@@ -173,7 +173,11 @@ fn get_ranges(content_length: u64, parts: u64) -> impl Iterator<Item = RangeQuer
 fn dest_from_url(url: &url::Url) -> PathBuf {
     if let Some(segments) = url.path_segments() {
         let last_segment = segments.last().unwrap_or("index.html");
-        PathBuf::from(last_segment)
+        if last_segment == "" {
+            PathBuf::from("index.html")
+        } else {
+            PathBuf::from(last_segment)
+        }
     } else {
         PathBuf::from("index.html")
     }
