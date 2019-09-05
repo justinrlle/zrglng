@@ -4,6 +4,7 @@ use async_std::{fs, task};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use futures::future::try_join_all;
@@ -19,23 +20,78 @@ struct FileInfo {
 }
 
 #[derive(Debug, Clone)]
-struct Options {
-    parts: u64,
-    url: String,
-    dest: PathBuf,
-}
-
-#[derive(Debug, Clone)]
 struct RangeQuery {
     range: Range<u64>,
     idx: u64,
 }
 
-async fn file_info(url: &str) -> Result<FileInfo> {
+#[derive(Debug, Clone)]
+struct PartialGetter {
+    range: Range<u64>,
+    idx: u64,
+    url: String,
+    dest: PathBuf,
+}
+
+impl PartialGetter {
+    fn new(range: RangeQuery, url: &str, dest: &PathBuf) -> Self {
+        let RangeQuery { range, idx } = range;
+        let dest = {
+            let mut dest =  PathBuf::from(dest);
+            let mut filename = std::ffi::OsString::from(".");
+            let final_filename = dest
+                .file_name()
+                .expect("was supposed to be a filename")
+                .to_owned();
+            filename.push(final_filename);
+            filename.push(format!(".part-{}", idx));
+            log::info!("downloading part {} at {:?}", idx, &filename);
+            dest.set_file_name(&filename);
+            dest
+        };
+        Self {
+            range,
+            idx,
+            url: url.to_owned(),
+            dest,
+        }
+    }
+
+    async fn get(self, client: Arc<isahc::HttpClient>) -> Result<(u64, PathBuf)> {
+        let range_header = format!("bytes={}-{}", self.range.start, self.range.end - 1);
+
+        let req = http::Request::get(self.url.as_str())
+            .header(http::header::USER_AGENT, USER_AGENT)
+            .header(http::header::RANGE, range_header.as_str())
+            .body(())?;
+
+        let mut res = client.send_async(req)
+            .await
+        .map_err(|e| err_of!(e, "failed partial get for range: {:?}", self.range))?;
+
+        if !res.status().is_success() {
+            bail!("invalid status code: {}", res.status());
+        }
+
+        log::debug!("creating file");
+        let mut file = fs::File::create(PathBuf::from(&self.dest))
+            .await
+            .map_err(|e| err_of!(e, "failed to create tmp file at {}", &self.dest.display()))?;
+        log::debug!("copying chunks from req to file");
+        futures::io::AsyncReadExt::copy_into(res.body_mut(), &mut file)
+            .await
+            .map_err(|e| err_of!(e, "failed to write file"))?;
+
+        log::debug!("finished downloading part {}", self.idx);
+        Ok((self.idx, self.dest))
+    }
+}
+
+async fn file_info(client: &isahc::HttpClient, url: &str) -> Result<FileInfo> {
     let req = http::Request::head(url)
         .header(http::header::USER_AGENT, USER_AGENT)
         .body(())?;
-    let res = isahc::send_async(req).await?;
+    let res = client.send_async(req).await?;
 
     if !res.status().is_success() {
         bail!("invalid status code");
@@ -57,70 +113,37 @@ async fn file_info(url: &str) -> Result<FileInfo> {
     })
 }
 
-async fn partial_get(url: &str, dest: &Path, range: RangeQuery) -> Result<(u64, PathBuf)> {
-    let mut tmp_path = PathBuf::from(dest);
-    let filename = {
-        let mut filename = std::ffi::OsString::from(".");
-        let final_filename = tmp_path
-            .file_name()
-            .ok_or_else(|| err!("expected a file, got a directory"))?
-            .to_owned();
-        filename.push(final_filename);
-        filename.push(format!(".part-{}", range.idx));
-        filename
-    };
-    log::info!("downloading part {} at {:?}", range.idx, &filename);
-    tmp_path.set_file_name(&filename);
-    let range_header = format!("bytes={}-{}", range.range.start, range.range.end - 1);
-    let range_header: &str = range_header.as_ref();
+async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
+    // TODO: assert that dest is a file
+    let client = isahc::HttpClient::builder()
+        .redirect_policy(isahc::config::RedirectPolicy::Follow)
+        .tcp_keepalive(std::time::Duration::from_secs(1))
+        .build()?;
 
-    let req = http::Request::get(url)
-        .header(http::header::USER_AGENT, USER_AGENT)
-        .header(http::header::RANGE, range_header)
-        .body(())?;
-
-    let mut res = isahc::send_async(req)
-        .await
-        .map_err(|e| err_of!(e, "failed partial get for range: {:?}", range.range))?;
-
-    if !res.status().is_success() {
-        bail!("invalid status code");
-    }
-    log::debug!("creating file");
-    let mut file = fs::File::create(PathBuf::from(&tmp_path))
-        .await
-        .map_err(|e| err_of!(e, "failed to create tmp file at {}", &tmp_path.display()))?;
-    log::debug!("copying chunks from req to file");
-    futures::io::AsyncReadExt::copy_into(res.body_mut(), &mut file)
-        .await
-        .map_err(|e| err_of!(e, "failed to write file"))?;
-
-    log::debug!("finished downloading part {}", range.idx);
-    Ok((range.idx, tmp_path))
-}
-
-async fn parallel_get(opts: &Options) -> Result<()> {
-    let file_info = file_info(opts.url.as_str())
+    let file_info = file_info(&client, url)
         .await
         .map_err(|e| err_of!(e, "failed to do HEAD req"))?;
     log::info!("file size: {}, supports range: {}", &file_info.content_length, &file_info.supports_range);
     let parts = if file_info.supports_range {
-        opts.parts
+        parts
     } else {
         1
     };
     let ranges = get_ranges(file_info.content_length, parts);
     log::trace!("ranges: {:?}", ranges.clone().collect::<Vec<_>>());
 
+    let client = Arc::new(client);
+
     let partial_reqs = ranges.map(|range| {
-        let opts: Options = opts.clone();
-        task::spawn(async move { partial_get(opts.url.as_str(), &opts.dest, range).await })
+        let partial_getter = PartialGetter::new(range, url, &dest);
+        let client = client.clone();
+        task::spawn(async move { partial_getter.get(client).await })
     });
 
     let mut files = try_join_all(partial_reqs)
         .await
         .map_err(|e| err_of!(e, "failed to download a part"))?;
-    let mut out_file = fs::File::create(&opts.dest).await?;
+    let mut out_file = fs::File::create(&dest).await?;
     files.sort_unstable_by_key(|&(idx, _)| idx);
     for (_, path) in files {
         let file = fs::File::open(&path).await?;
@@ -159,12 +182,7 @@ fn dest_from_url(url: &url::Url) -> PathBuf {
 async fn run() -> Result<()> {
     let target_url = "http://i.redd.it/f61r13m3k2931.jpg";
     let url = url::Url::parse(target_url)?;
-    let opts = Options {
-        parts: 2,
-        url: target_url.to_owned(),
-        dest: dest_from_url(&url),
-    };
-    parallel_get(&opts).await?;
+    parallel_get(target_url, dest_from_url(&url), 2).await?;
     Ok(())
 }
 
