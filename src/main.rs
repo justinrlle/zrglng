@@ -3,7 +3,7 @@ mod error;
 use async_std::{fs, task};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
-use futures::future::try_join_all;
+use futures_util::try_future::try_join_all;
 
 static USER_AGENT: &str = concat!("zrglng/", env!("CARGO_PKG_VERSION"));
 
@@ -79,7 +79,7 @@ impl PartialGetter {
             .await
             .map_err(|e| err_of!(e, "failed to create tmp file at {}", &self.dest.display()))?;
         log::debug!("copying chunks from req to file");
-        futures::io::AsyncReadExt::copy_into(res.body_mut(), &mut file)
+        futures_util::io::AsyncReadExt::copy_into(res.body_mut(), &mut file)
             .await
             .map_err(|e| err_of!(e, "failed to write file"))?;
 
@@ -148,7 +148,7 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
     files.sort_unstable_by_key(|&(idx, _)| idx);
     for (_, path) in files {
         let file = fs::File::open(&path).await?;
-        futures::io::AsyncReadExt::copy_into(file, &mut out_file).await?;
+        futures_util::io::AsyncReadExt::copy_into(file, &mut out_file).await?;
         fs::remove_file(&path).await?;
     }
     Ok(())
