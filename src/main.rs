@@ -1,6 +1,6 @@
 mod error;
 
-use async_std::{fs, task};
+use async_std::{fs, task, prelude::*};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use futures_util::try_future::try_join_all;
@@ -84,9 +84,20 @@ impl PartialGetter {
             .await
             .map_err(|e| err_of!(e, "failed to create tmp file at {}", &self.dest.display()))?;
         log::debug!("copying chunks from req to file");
-        futures_util::io::AsyncReadExt::copy_into(res.body_mut(), &mut file)
-            .await
-            .map_err(|e| err_of!(e, "failed to write file"))?;
+
+        let body = res.body_mut();
+        let mut buf = [0; 8192];
+        let mut count = 0;
+        while let n_read = body.read(&mut buf).await.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))? {
+            if n_read == 0 {
+                break
+            }
+            count += n_read;
+            log::info!("part {}: {}/{} bytes", self.idx, count, self.range.end - self.range.start);
+
+            let out_buf = &buf[0..n_read];
+            file.write_all(out_buf).await.map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
+        }
 
         log::debug!("finished downloading part {}", self.idx);
         Ok((self.idx, self.dest))
