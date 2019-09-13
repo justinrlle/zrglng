@@ -22,6 +22,11 @@ struct RangeQuery {
 }
 
 #[derive(Debug, Clone)]
+struct Context {
+    client: Arc<isahc::HttpClient>,
+}
+
+#[derive(Debug, Clone)]
 struct PartialGetter {
     range: Range<u64>,
     idx: u64,
@@ -53,7 +58,7 @@ impl PartialGetter {
         }
     }
 
-    async fn get(self, client: Arc<isahc::HttpClient>) -> Result<(u64, PathBuf)> {
+    async fn get(self, ctx: Context) -> Result<(u64, PathBuf)> {
         let range_header = format!("bytes={}-{}", self.range.start, self.range.end - 1);
 
         let req = http::Request::get(self.url.as_str())
@@ -61,7 +66,7 @@ impl PartialGetter {
             .header(http::header::RANGE, range_header.as_str())
             .body(())?;
 
-        let mut res = client.send_async(req).await.map_err(|e| {
+        let mut res = ctx.client.send_async(req).await.map_err(|e| {
             err_of!(
                 e,
                 "failed partial get #{} for range: {:?}",
@@ -134,11 +139,12 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
     log::trace!("ranges: {:?}", ranges.clone().collect::<Vec<_>>());
 
     let client = Arc::new(client);
+    let ctx = Context { client, };
 
     let partial_reqs = ranges.map(|range| {
         let partial_getter = PartialGetter::new(range, url, &dest);
-        let client = client.clone();
-        task::spawn(async move { partial_getter.get(client).await })
+        let ctx = ctx.clone();
+        task::spawn(async move { partial_getter.get(ctx).await })
     });
 
     let mut files = try_join_all(partial_reqs)

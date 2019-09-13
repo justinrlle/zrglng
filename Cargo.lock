@@ -745,7 +745,7 @@ name = "zrglng"
 version = "0.1.0"
 dependencies = [
  "async-std 0.99.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures-channel-preview 0.3.0-alpha.18 (registry+https://github.com/rust-lang/crates.io-index)",
+ "crossbeam-channel 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-util-preview 0.3.0-alpha.18 (registry+https://github.com/rust-lang/crates.io-index)",
  "http 0.1.18 (registry+https://github.com/rust-lang/crates.io-index)",
  "isahc 0.7.3 (registry+https://github.com/rust-lang/crates.io-index)",
