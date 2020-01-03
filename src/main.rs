@@ -1,7 +1,7 @@
 mod error;
 
-use tokio::{fs, task, prelude::*};
 use std::{ops::Range, path::PathBuf, sync::Arc};
+use tokio::{fs, prelude::*, task};
 
 use futures_util::StreamExt;
 
@@ -63,9 +63,13 @@ impl PartialGetter {
     async fn get(self, ctx: Context) -> Result<(u64, PathBuf)> {
         let range_header = format!("bytes={}-{}", self.range.start, self.range.end - 1);
 
-        let res = ctx.client.get(self.url.as_str())
+        let res = ctx
+            .client
+            .get(self.url.as_str())
             .header(reqwest::header::RANGE, range_header.as_str())
-            .send().await.map_err(|e| {
+            .send()
+            .await
+            .map_err(|e| {
                 err_of!(
                     e,
                     "failed partial get #{} for range: {:?}",
@@ -73,7 +77,6 @@ impl PartialGetter {
                     self.range
                 )
             })?;
-
 
         if !res.status().is_success() {
             bail!("invalid status code: {}", res.status());
@@ -89,11 +92,19 @@ impl PartialGetter {
         let mut count = 0;
 
         while let Some(bytes) = bytes_stream.next().await {
-            let bytes = bytes.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))?;
+            let bytes =
+                bytes.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))?;
             count += bytes.len();
-            log::info!("part {}: {}/{} bytes", self.idx, count, self.range.end - self.range.start);
+            log::info!(
+                "part {}: {}/{} bytes",
+                self.idx,
+                count,
+                self.range.end - self.range.start
+            );
 
-            file.write_all(&bytes).await.map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
+            file.write_all(&bytes)
+                .await
+                .map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
         }
 
         log::debug!("finished downloading part {}", self.idx);
@@ -141,7 +152,7 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
     log::trace!("ranges: {:?}", ranges.clone().collect::<Vec<_>>());
 
     let client = Arc::new(client);
-    let ctx = Context { client, };
+    let ctx = Context { client };
 
     let partial_reqs = ranges.map(|range| {
         let partial_getter = PartialGetter::new(range, url, &dest);
