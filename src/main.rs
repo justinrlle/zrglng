@@ -1,9 +1,11 @@
 mod error;
 
-use async_std::{fs, task, prelude::*};
+use tokio::{fs, task, prelude::*};
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
-use futures_util::try_future::try_join_all;
+use futures_util::StreamExt;
+
+use futures_util::future::try_join_all;
 
 static USER_AGENT: &str = concat!("zrglng/", env!("CARGO_PKG_VERSION"));
 
@@ -23,7 +25,7 @@ struct RangeQuery {
 
 #[derive(Debug, Clone)]
 struct Context {
-    client: Arc<isahc::HttpClient>,
+    client: Arc<reqwest::Client>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,19 +63,17 @@ impl PartialGetter {
     async fn get(self, ctx: Context) -> Result<(u64, PathBuf)> {
         let range_header = format!("bytes={}-{}", self.range.start, self.range.end - 1);
 
-        let req = http::Request::get(self.url.as_str())
-            .header(http::header::USER_AGENT, USER_AGENT)
-            .header(http::header::RANGE, range_header.as_str())
-            .body(())?;
+        let res = ctx.client.get(self.url.as_str())
+            .header(reqwest::header::RANGE, range_header.as_str())
+            .send().await.map_err(|e| {
+                err_of!(
+                    e,
+                    "failed partial get #{} for range: {:?}",
+                    self.idx,
+                    self.range
+                )
+            })?;
 
-        let mut res = ctx.client.send_async(req).await.map_err(|e| {
-            err_of!(
-                e,
-                "failed partial get #{} for range: {:?}",
-                self.idx,
-                self.range
-            )
-        })?;
 
         if !res.status().is_success() {
             bail!("invalid status code: {}", res.status());
@@ -85,18 +85,15 @@ impl PartialGetter {
             .map_err(|e| err_of!(e, "failed to create tmp file at {}", &self.dest.display()))?;
         log::debug!("copying chunks from req to file");
 
-        let body = res.body_mut();
-        let mut buf = [0; 8192];
+        let mut bytes_stream = res.bytes_stream();
         let mut count = 0;
-        while let n_read = body.read(&mut buf).await.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))? {
-            if n_read == 0 {
-                break
-            }
-            count += n_read;
+
+        while let Some(bytes) = bytes_stream.next().await {
+            let bytes = bytes.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))?;
+            count += bytes.len();
             log::info!("part {}: {}/{} bytes", self.idx, count, self.range.end - self.range.start);
 
-            let out_buf = &buf[0..n_read];
-            file.write_all(out_buf).await.map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
+            file.write_all(&bytes).await.map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
         }
 
         log::debug!("finished downloading part {}", self.idx);
@@ -104,24 +101,18 @@ impl PartialGetter {
     }
 }
 
-async fn file_info(client: &isahc::HttpClient, url: &str) -> Result<FileInfo> {
-    let req = http::Request::head(url)
-        .header(http::header::USER_AGENT, USER_AGENT)
-        .body(())?;
-    let res = client.send_async(req).await?;
+async fn file_info(client: &reqwest::Client, url: &str) -> Result<FileInfo> {
+    let res = client.head(url).send().await?;
 
     if !res.status().is_success() {
         bail!("invalid status code");
     }
     let content_length = res
-        .headers()
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| err!("no content type"))?
-        .parse::<u64>()?;
+        .content_length()
+        .ok_or_else(|| err!("no content type"))?;
     let supports_range = res
         .headers()
-        .get(http::header::ACCEPT_RANGES)
+        .get(reqwest::header::ACCEPT_RANGES)
         .map(|v| v == "bytes")
         .unwrap_or(false);
     Ok(FileInfo {
@@ -132,9 +123,9 @@ async fn file_info(client: &isahc::HttpClient, url: &str) -> Result<FileInfo> {
 
 async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
     // TODO: assert that dest is a file
-    let client = isahc::HttpClient::builder()
-        .redirect_policy(isahc::config::RedirectPolicy::Follow)
-        .tcp_keepalive(std::time::Duration::from_secs(1))
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .use_native_tls()
         .build()?;
 
     let file_info = file_info(&client, url)
@@ -158,14 +149,15 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
         task::spawn(async move { partial_getter.get(ctx).await })
     });
 
-    let mut files = try_join_all(partial_reqs)
+    let files = try_join_all(partial_reqs)
         .await
         .map_err(|e| err_of!(e, "one of the parts failed to download"))?;
     let mut out_file = fs::File::create(&dest).await?;
+    let mut files = files.into_iter().collect::<Result<Vec<_>>>()?;
     files.sort_unstable_by_key(|&(idx, _)| idx);
     for (_, path) in files {
-        let file = fs::File::open(&path).await?;
-        futures_util::io::AsyncReadExt::copy_into(file, &mut out_file).await?;
+        let mut file = fs::File::open(&path).await?;
+        tokio::io::copy(&mut file, &mut out_file).await?;
         fs::remove_file(&path).await?;
     }
     Ok(())
@@ -220,7 +212,8 @@ struct Args {
 fn main() {
     pretty_env_logger::init_timed();
     let args = <Args as structopt::StructOpt>::from_args();
-    task::block_on(async {
+    let mut runtime = tokio::runtime::Runtime::new().expect("could not create tokio runtime");
+    runtime.block_on(async {
         if let Err(err) = run(args).await {
             eprintln!("Error: {}", err);
             let sources = std::iter::successors(err.source(), |err| err.source());
