@@ -1,15 +1,10 @@
-mod error;
-
 use std::{ops::Range, path::PathBuf, sync::Arc};
+
+use anyhow::{anyhow, bail, Context as _, Result};
 use tokio::{fs, prelude::*, task};
-
-use futures_util::StreamExt;
-
-use futures_util::future::try_join_all;
+use futures_util::{future::try_join_all, StreamExt};
 
 static USER_AGENT: &str = concat!("zrglng/", env!("CARGO_PKG_VERSION"));
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, Clone)]
 struct FileInfo {
@@ -69,12 +64,10 @@ impl PartialGetter {
             .header(reqwest::header::RANGE, range_header.as_str())
             .send()
             .await
-            .map_err(|e| {
-                err_of!(
-                    e,
+            .with_context(|| {
+                format!(
                     "failed partial get #{} for range: {:?}",
-                    self.idx,
-                    self.range
+                    self.idx, self.range
                 )
             })?;
 
@@ -85,7 +78,7 @@ impl PartialGetter {
         log::debug!("creating file");
         let mut file = fs::File::create(PathBuf::from(&self.dest))
             .await
-            .map_err(|e| err_of!(e, "failed to create tmp file at {}", &self.dest.display()))?;
+            .with_context(|| format!("failed to create tmp file at {}", &self.dest.display()))?;
         log::debug!("copying chunks from req to file");
 
         let mut bytes_stream = res.bytes_stream();
@@ -93,7 +86,7 @@ impl PartialGetter {
 
         while let Some(bytes) = bytes_stream.next().await {
             let bytes =
-                bytes.map_err(|e| err_of!(e, "failed to read from body at byte {}", count))?;
+                bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
             count += bytes.len();
             log::info!(
                 "part {}: {}/{} bytes",
@@ -104,7 +97,7 @@ impl PartialGetter {
 
             file.write_all(&bytes)
                 .await
-                .map_err(|e| err_of!(e, "failed to write to file at byte {}", count))?;
+                .with_context(|| format!("failed to write to file at byte {}", count))?;
         }
 
         log::debug!("finished downloading part {}", self.idx);
@@ -120,7 +113,7 @@ async fn file_info(client: &reqwest::Client, url: &str) -> Result<FileInfo> {
     }
     let content_length = res
         .content_length()
-        .ok_or_else(|| err!("no content type"))?;
+        .ok_or_else(|| anyhow!("no content type"))?;
     let supports_range = res
         .headers()
         .get(reqwest::header::ACCEPT_RANGES)
@@ -141,7 +134,7 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
 
     let file_info = file_info(&client, url)
         .await
-        .map_err(|e| err_of!(e, "failed to do HEAD req"))?;
+        .context("failed to do HEAD request")?;
     log::info!(
         "file size: {}, supports range: {}",
         &file_info.content_length,
@@ -162,7 +155,7 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
 
     let files = try_join_all(partial_reqs)
         .await
-        .map_err(|e| err_of!(e, "one of the parts failed to download"))?;
+        .context("one of the parts failed to download")?;
     let mut out_file = fs::File::create(&dest).await?;
     let mut files = files.into_iter().collect::<Result<Vec<_>>>()?;
     files.sort_unstable_by_key(|&(idx, _)| idx);
