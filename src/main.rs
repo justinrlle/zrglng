@@ -2,9 +2,9 @@ use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use color_eyre::eyre::{anyhow, bail, Context as _, Result};
 
-use reqwest::header::HeaderValue;
-use tokio::{fs, task, io::AsyncWriteExt};
 use futures_util::{future::try_join_all, StreamExt};
+use reqwest::header::HeaderValue;
+use tokio::{fs, io::AsyncWriteExt, task};
 
 static USER_AGENT: &str = concat!("zrglng/", env!("CARGO_PKG_VERSION"));
 
@@ -86,8 +86,6 @@ impl PartialGetter {
         let mut bytes_stream = res.bytes_stream();
         let mut count = 0;
 
-
-
         while let Some(bytes) = bytes_stream.next().await {
             let bytes =
                 bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
@@ -112,9 +110,11 @@ impl PartialGetter {
 async fn file_info(client: &reqwest::Client, url: &str) -> Result<FileInfo> {
     let res = client.head(url).send().await?;
 
-    log::info!("file_info: {:#?}, content_length: {:?}", res, res
-        .headers()
-        .get(reqwest::header::CONTENT_LENGTH));
+    log::info!(
+        "file_info: {:#?}, content_length: {:?}",
+        res,
+        res.headers().get(reqwest::header::CONTENT_LENGTH)
+    );
     if !res.status().is_success() {
         bail!("invalid status code");
     }
@@ -125,7 +125,7 @@ async fn file_info(client: &reqwest::Client, url: &str) -> Result<FileInfo> {
         .to_str()
         .map_err(|e| anyhow!(e))
         .and_then(|h| h.parse::<u64>().map_err(Into::into))
-        .with_context(|| format!("invalid content-length header"))?;
+        .with_context(|| "invalid content-length header".to_owned())?;
 
     let supports_range = res
         .headers()
@@ -186,17 +186,18 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
 }
 
 async fn full_get(client: &reqwest::Client, url: &str, dest: PathBuf) -> Result<()> {
-    let res = client.get(url)
+    let res = client
+        .get(url)
         .send()
         .await
-        .with_context(|| {
-            format!("failed full partial get")
-        })?;
+        .with_context(|| "failed full partial get".to_owned())?;
     if !res.status().is_success() {
         bail!("invalid status code: {}", res.status());
     }
 
-    let content_length = res.content_length().ok_or_else(|| anyhow!("no content length"))?;
+    let content_length = res
+        .content_length()
+        .ok_or_else(|| anyhow!("no content length"))?;
 
     log::debug!("creating file");
     let mut file = fs::File::create(PathBuf::from(&dest))
@@ -208,14 +209,9 @@ async fn full_get(client: &reqwest::Client, url: &str, dest: PathBuf) -> Result<
     let mut count = 0;
 
     while let Some(bytes) = bytes_stream.next().await {
-        let bytes =
-            bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
+        let bytes = bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
         count += bytes.len();
-        log::info!(
-            "{}/{} bytes",
-            count,
-            content_length
-            );
+        log::info!("{}/{} bytes", count, content_length);
 
         file.write_all(&bytes)
             .await
@@ -246,7 +242,7 @@ fn get_ranges(content_length: u64, parts: u64) -> impl Iterator<Item = RangeQuer
 fn dest_from_url(url: &url::Url) -> PathBuf {
     if let Some(segments) = url.path_segments() {
         let last_segment = segments.last().unwrap_or("index.html");
-        if last_segment == "" {
+        if last_segment.is_empty() {
             PathBuf::from("index.html")
         } else {
             PathBuf::from(last_segment)
@@ -278,7 +274,8 @@ fn main() {
     color_eyre::install().expect("failexd to install color eyre handler - this is a bug");
     pretty_env_logger::init_timed();
     let args = <Args as structopt::StructOpt>::from_args();
-    tokio::runtime::Builder::new_multi_thread().enable_all()
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
         .build()
         .expect("could not create tokio runtime")
         .block_on(async {
