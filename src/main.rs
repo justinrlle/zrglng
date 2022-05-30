@@ -1,7 +1,9 @@
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
-use anyhow::{anyhow, bail, Context as _, Result};
-use tokio::{fs, prelude::*, task};
+use color_eyre::eyre::{anyhow, bail, Context as _, Result};
+
+use reqwest::header::HeaderValue;
+use tokio::{fs, task, io::AsyncWriteExt};
 use futures_util::{future::try_join_all, StreamExt};
 
 static USER_AGENT: &str = concat!("zrglng/", env!("CARGO_PKG_VERSION"));
@@ -79,21 +81,23 @@ impl PartialGetter {
         let mut file = fs::File::create(PathBuf::from(&self.dest))
             .await
             .with_context(|| format!("failed to create tmp file at {}", &self.dest.display()))?;
-        log::debug!("copying chunks from req to file");
+        log::debug!("copying chunks from res to file");
 
         let mut bytes_stream = res.bytes_stream();
         let mut count = 0;
+
+
 
         while let Some(bytes) = bytes_stream.next().await {
             let bytes =
                 bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
             count += bytes.len();
-            log::info!(
-                "part {}: {}/{} bytes",
-                self.idx,
-                count,
-                self.range.end - self.range.start
-            );
+            // log::info!(
+            //     "part {}: {}/{} bytes",
+            //     self.idx,
+            //     count,
+            //     self.range.end - self.range.start
+            // );
 
             file.write_all(&bytes)
                 .await
@@ -108,12 +112,21 @@ impl PartialGetter {
 async fn file_info(client: &reqwest::Client, url: &str) -> Result<FileInfo> {
     let res = client.head(url).send().await?;
 
+    log::info!("file_info: {:#?}, content_length: {:?}", res, res
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH));
     if !res.status().is_success() {
         bail!("invalid status code");
     }
     let content_length = res
-        .content_length()
-        .ok_or_else(|| anyhow!("no content type"))?;
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .unwrap_or(&HeaderValue::from_static("0"))
+        .to_str()
+        .map_err(|e| anyhow!(e))
+        .and_then(|h| h.parse::<u64>().map_err(Into::into))
+        .with_context(|| format!("invalid content-length header"))?;
+
     let supports_range = res
         .headers()
         .get(reqwest::header::ACCEPT_RANGES)
@@ -140,7 +153,12 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
         &file_info.content_length,
         &file_info.supports_range
     );
-    let parts = if file_info.supports_range { parts } else { 1 };
+    if !file_info.supports_range {
+        return full_get(&client, url, dest).await;
+    }
+    if file_info.content_length == 0 {
+        bail!("file size is 0, we cannot split it");
+    }
     let ranges = get_ranges(file_info.content_length, parts);
     log::trace!("ranges: {:?}", ranges.clone().collect::<Vec<_>>());
 
@@ -164,6 +182,47 @@ async fn parallel_get(url: &str, dest: PathBuf, parts: u64) -> Result<()> {
         tokio::io::copy(&mut file, &mut out_file).await?;
         fs::remove_file(&path).await?;
     }
+    Ok(())
+}
+
+async fn full_get(client: &reqwest::Client, url: &str, dest: PathBuf) -> Result<()> {
+    let res = client.get(url)
+        .send()
+        .await
+        .with_context(|| {
+            format!("failed full partial get")
+        })?;
+    if !res.status().is_success() {
+        bail!("invalid status code: {}", res.status());
+    }
+
+    let content_length = res.content_length().ok_or_else(|| anyhow!("no content length"))?;
+
+    log::debug!("creating file");
+    let mut file = fs::File::create(PathBuf::from(&dest))
+        .await
+        .with_context(|| format!("failed to create tmp file at {}", &dest.display()))?;
+    log::debug!("copying chunks from res to file");
+
+    let mut bytes_stream = res.bytes_stream();
+    let mut count = 0;
+
+    while let Some(bytes) = bytes_stream.next().await {
+        let bytes =
+            bytes.with_context(|| format!("failed to read from body at byte {}", count))?;
+        count += bytes.len();
+        log::info!(
+            "{}/{} bytes",
+            count,
+            content_length
+            );
+
+        file.write_all(&bytes)
+            .await
+            .with_context(|| format!("failed to write to file at byte {}", count))?;
+    }
+
+    log::debug!("finished downloading");
     Ok(())
 }
 
@@ -198,9 +257,11 @@ fn dest_from_url(url: &url::Url) -> PathBuf {
 }
 
 async fn run(args: Args) -> Result<()> {
+    let begin = tokio::time::Instant::now();
     let url = url::Url::parse(args.url.as_str())?;
     let dest = args.output.unwrap_or_else(|| dest_from_url(&url));
     parallel_get(args.url.as_str(), dest, args.parts).await?;
+    println!("finished in {} milliseconds.", begin.elapsed().as_millis());
     Ok(())
 }
 
@@ -214,17 +275,20 @@ struct Args {
 }
 
 fn main() {
+    color_eyre::install().expect("failexd to install color eyre handler - this is a bug");
     pretty_env_logger::init_timed();
     let args = <Args as structopt::StructOpt>::from_args();
-    let mut runtime = tokio::runtime::Runtime::new().expect("could not create tokio runtime");
-    runtime.block_on(async {
-        if let Err(err) = run(args).await {
-            eprintln!("Error: {}", err);
-            let sources = std::iter::successors(err.source(), |err| err.source());
-            for source in sources {
-                eprintln!("  caused by: {}", source);
+    tokio::runtime::Builder::new_multi_thread().enable_all()
+        .build()
+        .expect("could not create tokio runtime")
+        .block_on(async {
+            if let Err(err) = run(args).await {
+                eprintln!("Error: {}", err);
+                let sources = std::iter::successors(err.source(), |err| err.source());
+                for source in sources {
+                    eprintln!("  caused by: {}", source);
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
-        }
-    })
+        })
 }
